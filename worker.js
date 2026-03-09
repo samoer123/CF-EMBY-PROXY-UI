@@ -886,7 +886,8 @@ const Database = {
     const kv = this.getKV(env);
     if (!kv) return new Response(JSON.stringify({ error: "kv_missing" }), { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
     let data; try { data = await request.json(); } catch { return new Response(JSON.stringify({ error: "invalid_json" }), { status: 400, headers: { ...corsHeaders } }); }
-    const invalidate = async (name) => { GLOBALS.NodeCache.delete(name); await CacheManager.invalidateList(ctx); };
+    // 🌟 性能防御：仅清除单体缓存，严禁主动销毁 NodesListCache 导致全站并发重读
+    const invalidate = (name) => { GLOBALS.NodeCache.delete(name); };
     
     switch (data.action) {
       case "getDashboardStats": {
@@ -1216,6 +1217,23 @@ const Database = {
               return jsonError("REPORT_FAILED", e.message);
           }
       }
+
+      case "pingNode": {
+          const node = await this.getNode(data.name, env, ctx);
+          if (!node || !node.target) return jsonError("NOT_FOUND", "节点不存在");
+          // 取第一个目标源站进行真实回源探测
+          const targets = String(node.target).split(",").map(i => i.trim()).filter(Boolean);
+          const start = Date.now();
+          try {
+              const controller = new AbortController();
+              const timeoutId = setTimeout(() => controller.abort(), parseInt(data.timeout || 5000));
+              await fetch(targets[0], { method: 'HEAD', signal: controller.signal });
+              clearTimeout(timeoutId);
+              return jsonResponse({ ms: Date.now() - start });
+          } catch (e) {
+              return jsonResponse({ ms: 9999 });
+          }
+      }
       
       case "getLogs": {
         const db = this.getDB(env); if (!db) return new Response(JSON.stringify({ error: "D1 not configured" }), { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
@@ -1406,23 +1424,18 @@ const Proxy = {
       newHeaders.set("Connection", "keep-alive");
     }
     if ((isBigStream || isSegment || isManifest) && !adminCustomHeaders.has("referer")) newHeaders.delete("Referer");
-    if (isImage || isSubtitle || isManifest) newHeaders.delete("Range");
 
-    let preparedBody = null;
-    let preparedBodyMode = "none";
-    if (request.method !== "GET" && request.method !== "HEAD") {
-      const rawContentLength = request.headers.get("content-length");
-      const parsedContentLength = rawContentLength ? Number.parseInt(rawContentLength, 10) : NaN;
-      const hasKnownLength = Number.isFinite(parsedContentLength) && parsedContentLength >= 0;
-      if (hasKnownLength && parsedContentLength <= 10 * 1024 * 1024) {
-        preparedBody = await request.arrayBuffer();
-        preparedBodyMode = "buffered";
-      } else if (request.body) {
-        preparedBody = request.body;
-        preparedBodyMode = "stream";
-      }
-    }
-    const retryTargets = preparedBodyMode === "stream" ? targetBases.slice(0, 1) : targetBases;
+    // ================== 核心分流机制：三车道完美路由 ==================
+    // 1. 判定是否为带 Body 的非幂等请求 (POST/PUT/PATCH 等)
+    const isNonIdempotent = request.method !== "GET" && request.method !== "HEAD";
+    
+    // 2. 终极内存优化：强制使用纯流式 request.body，斩断 ArrayBuffer OOM 根源
+    const preparedBody = isNonIdempotent ? request.body : null;
+    const preparedBodyMode = (isNonIdempotent && request.body) ? "stream" : "none";
+    
+    // 3. 剥夺重试权利：POST/PUT 只取 targetBases[0]，GET/HEAD/WS 保留完整容灾队列
+    const retryTargets = isNonIdempotent ? targetBases.slice(0, 1) : targetBases;
+    // ==================================================================
     const sourceSameOriginProxy = currentConfig.sourceSameOriginProxy !== false;
     const forceExternalProxy = currentConfig.forceExternalProxy !== false;
     const wangpanDirectKeywords = getWangpanDirectText(currentConfig.wangpandirect || "");
@@ -1500,11 +1513,31 @@ const Proxy = {
           const fetchOptions = await buildFetchOptions(finalUrl, { isRetry });
           const response = await fetch(finalUrl.toString(), fetchOptions);
           
+          // 🌟 第三车道 (WebSocket 特权通道)
+          if (response.status === 101) {
+            return { response, targetBase: lastBase, finalUrl: lastFinalUrl };
+          }
+          
+          // 🌟 异常防御：403 降级重试拦截
           if (response.status === 403 && !isRetry && protocolFallback) {
+            // 如果是 POST 流式 body，已经被消费过一次，绝不能二次 fetch，直接原样返回
+            if (preparedBodyMode === "stream") {
+              return { response, targetBase, finalUrl };
+            }
+            // 销毁无用响应体，防止 CF 内存泄漏
+            try { response.body?.cancel?.(); } catch {}
             return await fetchUpstream(true); 
           }
           
-          if (!retryableStatuses.has(response.status) || index === retryTargets.length - 1) return { response, targetBase, finalUrl };
+          // 如果状态码正常，或是最后一个节点，直接返回
+          if (!retryableStatuses.has(response.status) || index === retryTargets.length - 1) {
+            return { response, targetBase, finalUrl };
+          }
+          
+          // 🌟 内存防御：在进入下一次重试循环前，必须手动销毁被废弃的响应体
+          if (lastResponse) {
+            try { lastResponse.body?.cancel?.(); } catch {}
+          }
           lastResponse = response;
         } catch (error) {
           lastError = error;
@@ -1614,7 +1647,13 @@ const Proxy = {
         modifiedHeaders.delete("Alt-Svc");
       }
 
-      if (isBigStream || isManifest || proxiedExternalRedirect) {
+      // 🌟 透传 Range 的同时，强行命令 CF 边缘节点缓存静态资源与高频探测
+      if (isImage || isSubtitle || isManifest) {
+        modifiedHeaders.set("Cache-Control", "public, max-age=86400");
+      } else if (isHeadPrewarm) {
+        // 对于播放器频繁的 HEAD 预热请求，给个 3 分钟的微型缓存，防止击穿源站
+        modifiedHeaders.set("Cache-Control", "public, max-age=180");
+      } else if (isBigStream || proxiedExternalRedirect) {
         modifiedHeaders.set("Cache-Control", "no-store");
       }
 
@@ -1756,7 +1795,8 @@ const Logger = {
       const statements = batchLogs.map(item => db.prepare(`INSERT INTO proxy_logs (timestamp, node_name, request_path, request_method, status_code, response_time, client_ip, user_agent, referer, category, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(item.timestamp, item.nodeName, item.requestPath, item.requestMethod, item.statusCode, item.responseTime, item.clientIp, item.userAgent, item.referer, item.category, item.createdAt));
       await db.batch(statements);
     } catch (e) {
-      GLOBALS.LogQueue.unshift(...batchLogs.slice(-100));
+      // 🌟 性能防御：D1 写入失败直接丢弃批次，严禁 unshift 导致队列内存堆积与时间轴错乱
+      console.log("Log flush failed, dropping batch.", e);
     }
   }
 };
@@ -2500,40 +2540,29 @@ const UI_HTML = `<!DOCTYPE html>
 
       async checkSingleNodeHealth(name, btnEl) {
           const originalHtml = btnEl.innerHTML;
-          btnEl.innerHTML = \`<i data-lucide="loader" class="w-4 h-4 animate-spin"></i>\`;
-          lucide.createIcons({root: btnEl.parentElement});
+          // 修复：使用单引号，防止截断外部的 UI_HTML 模板字符串
+          btnEl.innerHTML = '<i data-lucide="loader" class="w-4 h-4 animate-spin"></i>';
+          this.safeCreateIcons({root: btnEl.parentElement});
           
-          const n = this.nodes.find(x => String(x.name) === String(name));
-          if(n) {
-             const timeoutMs = parseInt(document.getElementById('cfg-ping-timeout')?.value) || 5000;
-             const start = Date.now();
-             try {
-                const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-                const proxyLink = this.buildNodeLink(n);
-                await fetch(proxyLink, { method: 'HEAD', cache:'no-store', signal: controller.signal });
-                clearTimeout(timeoutId);
-                this.updateNodeCardStatus(n.name, Date.now() - start);
-             } catch(e) {
-                this.updateNodeCardStatus(n.name, 9999);
-             }
+          try {
+             // 🌟 走 Worker API 测算真实的 CF 边缘到源站延迟
+             const timeout = parseInt(document.getElementById('cfg-ping-timeout')?.value) || 5000;
+             const res = await this.apiCall('pingNode', { name, timeout });
+             this.updateNodeCardStatus(name, res.ms || 9999);
+          } catch(e) {
+             this.updateNodeCardStatus(name, 9999);
           }
+          
           btnEl.innerHTML = originalHtml;
-          lucide.createIcons({root: btnEl.parentElement});
+          this.safeCreateIcons({root: btnEl.parentElement});
       },
 
       async checkAllNodesHealth() {
-          const timeoutMs = parseInt(document.getElementById('cfg-ping-timeout')?.value) || 5000;
+          const timeout = parseInt(document.getElementById('cfg-ping-timeout')?.value) || 5000;
           for(let n of this.nodes) {
-             const start = Date.now();
              try {
-                const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-                const proxyLink = this.buildNodeLink(n);
-                await fetch(proxyLink, { method: 'HEAD', cache:'no-store', signal: controller.signal });
-                clearTimeout(timeoutId);
-                const ms = Date.now() - start;
-                this.updateNodeCardStatus(n.name, ms);
+                const res = await this.apiCall('pingNode', { name: n.name, timeout });
+                this.updateNodeCardStatus(n.name, res.ms || 9999);
              } catch(e) {
                 this.updateNodeCardStatus(n.name, 9999);
              }
@@ -3125,7 +3154,7 @@ export default {
         if (db) {
           try {
             const retentionDays = config.logRetentionDays || 7; 
-            const expireTime = Date.当前() - (retentionDays * 24 * 60 * 60 * 1000);
+            const expireTime = Date.now() - (retentionDays * 24 * 60 * 60 * 1000);
             await db.prepare("DELETE FROM proxy_logs WHERE timestamp < ?").bind(expireTime).run();
           } catch (dbErr) {
             console.error("Scheduled DB Cleanup Error: ", dbErr);
